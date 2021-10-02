@@ -9,8 +9,9 @@ import requests
 import re
 
 parser = argparse.ArgumentParser(description="Creates a version.tf file with all versions updated based on restrictions such as ~>. Note that the version file needs to be a separate file having only the versions and nothing else.")
-parser.add_argument("-f", "--file", help="Versions file to read from, ie -f versions,tf")
-parser.add_argument("-w", "--write", help="Overwrite the version file to <versions_filename>.tf.json", action="store_true", default=False)
+parser.add_argument("-f", "--file", help="Versions file to read from, ie -f versions,tf", required=True)
+parser.add_argument("-w", "--write", help="Overwrite the version file with a fixed version json version <versions_filename>.tf.json", action="store_true", default=False)
+parser.add_argument("-u", "--update", help="Update the version file to the latest versions available", action="store_true", default=False)
 parser.add_argument("--json", help="By default this script read tf files in hcl. Use this switch to parse an already converted json file", action="store_true", default=False)
 args = parser.parse_args()
 
@@ -27,11 +28,11 @@ def main():
             else:
                 versions_json = hcl2.load(versions_file)
     except:
-        print("ERROR: error while reading the version file, please check if " + versions_filename + " is available in this directory and its format is correct")
+        print("ERROR: error while reading the version file, please check if " + versions_filename + " is available in this directory and its format is in hcl or in json if --json has been set")
         exit()
 
     # terraform: get the local tf version
-    tf_version = versions_json["terraform"][0]["required_version"].replace(">= ", "")
+    tf_version = re.search(r"\d{1,2}\.\d{1,2}\.\d{1,2}", versions_json["terraform"][0]["required_version"])[0]
 
     # terraform: get the latest terraform version online allowed by the restriction and the current latest one
     tf_versions = get_tf_version(tf_version)
@@ -40,28 +41,33 @@ def main():
     print(f"terraform: {tf_latest_minor} (latest: {tf_latest})")
 
     # terraform: set the new tf version into the json
-    versions_json["terraform"][0]["required_version"] = "= " + tf_latest_minor
+    if args.update:
+        versions_json["terraform"][0]["required_version"] = ">= " + tf_latest
+    else:
+        versions_json["terraform"][0]["required_version"] = tf_latest_minor
 
     # Providers: get the latest version online allowed by the restriction and the current latest one for each provider
     for provider_name, provider_version in versions_json["terraform"][0]["required_providers"][0].items():
         version = provider_version['version']
         source = provider_version['source']
-        match_ver = re.search(r"\d{1,2}\.\d{1,2}\.\d{1,2}", version)
-        version = match_ver[0]
+        version = re.search(r"\d{1,2}\.\d{1,2}\.\d{1,2}", version)[0]
         provider_versions = get_provider_version(version, source)
         provider_latest = provider_versions[0]
         provider_latest_minor = provider_versions[1]
         print(f"{source}: {provider_latest_minor} (latest: {provider_latest})")
 
-        # Set the latest version back into the json
-        versions_json["terraform"][0]["required_providers"][0][provider_name] = {"source": source, "version": "= " + provider_latest_minor}
+        # Providers: set the new version back into the json
+        if args.update:
+            versions_json["terraform"][0]["required_providers"][0][provider_name] = {"source": source, "version": "~> " + provider_latest}
+        else:
+            versions_json["terraform"][0]["required_providers"][0][provider_name] = {"source": source, "version": provider_latest_minor}
 
     new_versions_file = json.dumps(versions_json, indent=2, sort_keys=False)
-
+    
     if args.write:
         # Delete the original versions file
         os.remove(versions_filename)
-        # Write the updated file with fixed versions in json format
+        # Write the new versions file in json format
         with open(args.file.split(".")[0] + ".tf.json", 'w') as output_jsonfile:
             output_jsonfile.write(new_versions_file)
 
@@ -77,47 +83,38 @@ class SemVer:
         return f"{self.version[0]}.{self.version[1]}"
 
 
-def get_tf_version(local_tf_version):
+def get_tf_version(tf_version):
     tf_git_url = requests.get(url="https://api.github.com/repos/hashicorp/terraform/releases")
     online_versions = tf_git_url.json()
-
-    minor_version = SemVer(local_tf_version).minor()
-    latest_online_minor = local_tf_version
+    minor_version = SemVer(tf_version).minor()
     if "message" in online_versions:
         print(online_versions['message'])
         exit()
 
     for releases in online_versions:
-        for key, value in releases.items():
-            if key == "name":
-                match_ver = re.search(r"\d{1,2}\.\d{1,2}\.\d{1,2}", value)
-                if match_ver:
-                    online_version = match_ver[0].replace("v", "")
-                    if minor_version in SemVer(online_version).minor():
-                        if SemVer(online_version).patch_only() > SemVer(latest_online_minor).patch_only():
-                            latest_online_minor = online_version
+        online_version = re.search(r"\d{1,2}\.\d{1,2}\.\d{1,2}", releases['name'])[0]
+        if minor_version in SemVer(online_version).minor():
+            if SemVer(online_version).patch_only() > SemVer(tf_version).patch_only():
+                tf_version = online_version
 
     tf_git_url_json = requests.get(url="https://api.github.com/repos/hashicorp/terraform/releases/latest")
-    latest_online_version = tf_git_url_json.json()['name'].replace("v", "")
+    latest_online_version = re.search(r"\d{1,2}\.\d{1,2}\.\d{1,2}", tf_git_url_json.json()['name'])[0]
 
-    return [latest_online_version, latest_online_minor]
+    return [latest_online_version, tf_version]
 
 
-def get_provider_version(local_version, source):
+def get_provider_version(tf_version, source):
     tf_registry = requests.get(url="https://registry.terraform.io/v1/providers/" + source)
     online_versions = tf_registry.json()['versions']
     latest_online_version = tf_registry.json()['version']
-    latest_online_minor = local_version
-    minor_version = SemVer(local_version).minor()
+    minor_version = SemVer(tf_version).minor()
     for online_version in online_versions:
-        match_ver = re.search(r"\d{1,2}\.\d{1,2}\.\d{1,2}", online_version)
-        if match_ver:
-            online_version = match_ver[0].replace("v", "")
-            if minor_version in SemVer(online_version).minor():
-                if SemVer(online_version).patch_only() > SemVer(latest_online_minor).patch_only():
-                    latest_online_minor = online_version
+        online_version = re.search(r"\d{1,2}\.\d{1,2}\.\d{1,2}", online_version)[0]
+        if minor_version in SemVer(online_version).minor():
+            if SemVer(online_version).patch_only() > SemVer(tf_version).patch_only():
+                tf_version = online_version
 
-    return [latest_online_version, latest_online_minor]
+    return [latest_online_version, tf_version]
 
 
 if __name__ == '__main__':
